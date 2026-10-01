@@ -1,7 +1,6 @@
 package io.mo.mnblocker;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileWriter;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -34,13 +33,25 @@ final class SafetyManager {
     private static final int MAX_RESTARTS = 2;
     private static final long WINDOW_MS = 30_000L; // 30 seconds
 
-    private static final String FLAG_FILE = HookLogger.DIR + "/safe_mode";
+    static final String FLAG_FILE_NAME = "safe_mode";
+    static final String DISABLE_FLAG_FILE_NAME = "disable_safe_mode";
+
+    private final File flagFile;
+    private final File disableFlagFile;
 
     private final Deque<Long> systemUiDeaths = new ArrayDeque<>();
     private volatile boolean safeModeTripped;
+    private boolean safeModeDisabled;
 
     SafetyManager() {
-        this.safeModeTripped = readFlag();
+        this(new File(HookLogger.DIR));
+    }
+
+    SafetyManager(File directory) {
+        flagFile = new File(directory, FLAG_FILE_NAME);
+        disableFlagFile = new File(directory, DISABLE_FLAG_FILE_NAME);
+        safeModeDisabled = readFlag(disableFlagFile);
+        safeModeTripped = !safeModeDisabled && readFlag(flagFile);
         if (safeModeTripped) {
             HookLogger.w("Safe mode flag present on startup — hooks will stay disabled "
                     + "until /data/system/mnblocker/safe_mode is removed.");
@@ -62,7 +73,13 @@ final class SafetyManager {
      * resume without a reboot. Returns the resulting safe-mode state.
      */
     synchronized boolean syncFromDisk() {
-        boolean onDisk = readFlag();
+        boolean disabled = readFlag(disableFlagFile);
+        boolean onDisk = !disabled && readFlag(flagFile);
+        if (disabled != safeModeDisabled || (safeModeTripped && !onDisk)) {
+            // Re-enabling protection starts a fresh crash window.
+            systemUiDeaths.clear();
+        }
+        safeModeDisabled = disabled;
         if (onDisk != safeModeTripped) {
             safeModeTripped = onDisk;
             HookLogger.i("Safe mode flag re-synced from disk: "
@@ -76,6 +93,14 @@ final class SafetyManager {
      * Synchronized: AMS can report deaths from several threads.
      */
     synchronized void onSystemUiDied() {
+        // Read the override here too so a delayed observer cannot auto-trip
+        // protection after the user has disabled it.
+        if (readFlag(disableFlagFile) != safeModeDisabled) {
+            syncFromDisk();
+        }
+        if (safeModeDisabled) {
+            return;
+        }
         long now = System.currentTimeMillis();
         systemUiDeaths.addLast(now);
 
@@ -103,9 +128,9 @@ final class SafetyManager {
 
     // ----- flag file persistence -----
 
-    private boolean readFlag() {
+    private boolean readFlag(File file) {
         try {
-            return new File(FLAG_FILE).exists();
+            return file.exists();
         } catch (Throwable t) {
             return false;
         }
@@ -113,8 +138,11 @@ final class SafetyManager {
 
     private void writeFlag(String reason) {
         try {
-            HookLogger.ensureDir();
-            try (FileWriter fw = new FileWriter(FLAG_FILE, false)) {
+            File directory = flagFile.getParentFile();
+            if (!directory.exists() && !directory.mkdirs()) {
+                throw new java.io.IOException("Could not create " + directory);
+            }
+            try (FileWriter fw = new FileWriter(flagFile, false)) {
                 fw.write("tripped_at=" + System.currentTimeMillis() + "\n");
                 fw.write("reason=" + reason + "\n");
             }

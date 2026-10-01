@@ -45,7 +45,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 final class NotificationHook {
 
     private static final String SYSTEMUI_PKG = "com.android.systemui";
-    private static final String SAFE_MODE_FILE_NAME = "safe_mode";
+    private static final String SAFE_MODE_FILE_NAME = SafetyManager.FLAG_FILE_NAME;
 
     private final SafetyManager safety;
     private volatile RegexConfig config;
@@ -73,6 +73,7 @@ final class NotificationHook {
         // the hooks in place, and a runtime trip disable them — both without a
         // reboot.
         watchSafeModeFlag();
+        safety.syncFromDisk();
 
         if (safety.hookingAllowed()) {
             installHooks();
@@ -138,13 +139,14 @@ final class NotificationHook {
             flagObserver = new FileObserver(HookLogger.DIR, mask) {
                 @Override
                 public void onEvent(int event, String path) {
-                    if (SAFE_MODE_FILE_NAME.equals(path)) {
+                    if (SAFE_MODE_FILE_NAME.equals(path)
+                            || SafetyManager.DISABLE_FLAG_FILE_NAME.equals(path)) {
                         onSafeModeFlagChanged();
                     }
                 }
             };
             flagObserver.startWatching();
-            HookLogger.i("Watching " + HookLogger.DIR + " for safe_mode changes "
+            HookLogger.i("Watching " + HookLogger.DIR + " for safe-mode flag changes "
                     + "(reboot-free recovery active).");
         } catch (Throwable t) {
             HookLogger.e("Could not start safe_mode watcher — recovery will need a reboot.", t);

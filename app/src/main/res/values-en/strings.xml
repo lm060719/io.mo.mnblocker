@@ -222,6 +222,8 @@ Due to platform limits, a blocked notification briefly appears (possibly with a 
     <!-- ===== DebugActivity ===== -->
     <string name="debug_title">🛠 Debug Mode</string>
     <string name="debug_subtitle">These options are for troubleshooting only — no need to enable them for daily use.</string>
+    <string name="debug_disable_safe_mode_title">Disable Safe Mode</string>
+    <string name="debug_disable_safe_mode_desc">Disabled by default. When enabled, the current Safe Mode status will be cleared immediately, and Safe Mode will no longer be triggered.</string>
     <string name="debug_warning">⚠ Enabling log output writes to a file on every channel event, which may slightly affect performance. Turn it off when you\'re done troubleshooting.</string>
     <string name="logging_card_title">Log Control</string>
     <string name="debug_output_log_title">Output Log</string>

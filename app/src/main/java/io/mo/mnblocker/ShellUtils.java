@@ -70,6 +70,42 @@ final class ShellUtils {
     }
 
     private static final String SAFE_MODE_FILE = "/data/system/mnblocker/safe_mode";
+    private static final String DISABLE_SAFE_MODE_FILE =
+            HookLogger.DIR + "/" + SafetyManager.DISABLE_FLAG_FILE_NAME;
+
+    /** Persist the debug override and clear any previously tripped protection. */
+    static boolean setDisableSafeMode(boolean disabled) {
+        if (disabled) {
+            if (!suWriteFile(DISABLE_SAFE_MODE_FILE, "1\n")) {
+                return false;
+            }
+            if (!clearSafeMode()) {
+                // Roll back the override if the existing trip flag could not be cleared.
+                setDisableSafeMode(false);
+                return false;
+            }
+            return true;
+        }
+        try {
+            return runSu("rm -f '" + DISABLE_SAFE_MODE_FILE + "'").exitCode == 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    static boolean isDisableSafeMode() {
+        try {
+            if (new File(DISABLE_SAFE_MODE_FILE).exists()) {
+                return true;
+            }
+            if (missIsConclusive(DISABLE_SAFE_MODE_FILE)) {
+                return false;
+            }
+            return runSu("test -f '" + DISABLE_SAFE_MODE_FILE + "'").exitCode == 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
 
     /**
      * Whether "we could not read {@code path}" is a conclusive answer rather than
@@ -91,7 +127,7 @@ final class ShellUtils {
     }
 
     /**
-     * Clear the safe-mode flag so hooks are reinstalled on the next boot.
+     * Clear the safe-mode flag so the observer restores hooks without a reboot.
      * The file lives in /data/system (owned by system, UID 1000), so the
      * settings UI process cannot delete it directly — it must go through su.
      */
@@ -116,6 +152,9 @@ final class ShellUtils {
      * there. If the directory is readable, exists() is authoritative.
      */
     static boolean isSafeModeTripped() {
+        if (isDisableSafeMode()) {
+            return false;
+        }
         try {
             if (new File(SAFE_MODE_FILE).exists()) {
                 return true;

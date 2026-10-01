@@ -229,6 +229,8 @@
     <!-- ===== DebugActivity ===== -->
     <string name="debug_title">🛠 调试模式</string>
     <string name="debug_subtitle">以下选项仅用于排查问题，日常使用无需开启。</string>
+    <string name="debug_disable_safe_mode_title">禁用安全模式</string>
+    <string name="debug_disable_safe_mode_desc">默认关闭。开启后立即解除已触发的安全模式，并不再触发</string>
     <string name="debug_warning">⚠ 开启日志输出会在每次通知类别事件时写入文件，可能对性能有轻微影响。排查完毕后请关闭。</string>
     <string name="logging_card_title">日志控制</string>
     <string name="debug_output_log_title">输出日志</string>

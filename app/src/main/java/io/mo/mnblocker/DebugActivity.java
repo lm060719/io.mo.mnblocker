@@ -23,11 +23,12 @@ import android.widget.Toast;
  * Hidden debug screen, entered by tapping the app icon / name 5 times on the
  * About page.
  *
- * Two controls:
+ * Controls:
  *  1. "输出日志" switch — creates / deletes a flag file that HookLogger checks.
  *     Default OFF: hook.log is not written unless explicitly enabled.
  *  2. "导出 Hook 日志" button — copies hook.log to /sdcard/ via su.
  *     If hook.log does not exist, a bottom-anchored hint fades in and out.
+ *  3. "禁用安全模式" switch — bypasses automatic crash-loop protection.
  */
 public final class DebugActivity extends Activity
 {
@@ -42,6 +43,8 @@ public final class DebugActivity extends Activity
 
     private Switch logSwitch;
     private Switch disableXposedLogSwitch;
+    private Switch disableSafeModeSwitch;
+    private boolean updatingSafeModeSwitch;
     private Button[] levelButtons;
     private int currentLevel = HookLogger.LEVEL_ERROR;
     private FrameLayout rootFrame;
@@ -72,6 +75,7 @@ public final class DebugActivity extends Activity
 
         root.addView(titleSection());
         root.addView(warningCard());
+        root.addView(safetyCard());
         root.addView(loggingCard());
         root.addView(exportCard());
 
@@ -86,10 +90,13 @@ public final class DebugActivity extends Activity
         new Thread(() -> {
             boolean logEnabled = ShellUtils.isDebugLogging();
             boolean xposedDisabled = ShellUtils.isDisableXposedLog();
+            boolean safeModeDisabled = ShellUtils.isDisableSafeMode();
             int level = ShellUtils.getXposedLogLevel();
             runOnUiThread(() -> {
                 setCheckedSilently(logEnabled);
                 setXposedDisabledSilently(xposedDisabled);
+                setSafeModeDisabledSilently(safeModeDisabled);
+                disableSafeModeSwitch.setEnabled(true);
                 currentLevel = level;
                 updateLevelButtons(level);
                 setLevelButtonsEnabled(!xposedDisabled);
@@ -134,6 +141,60 @@ public final class DebugActivity extends Activity
         warn.setLineSpacing(dp(2), 1.0f);
         card.addView(warn);
 
+        return card;
+    }
+
+    private View safetyCard()
+    {
+        LinearLayout card = cardLayout();
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout labels = new LinearLayout(this);
+        labels.setOrientation(LinearLayout.VERTICAL);
+
+        TextView title = new TextView(this);
+        title.setText(R.string.debug_disable_safe_mode_title);
+        title.setTextColor(COLOR_TEXT);
+        title.setTextSize(15);
+        labels.addView(title);
+
+        TextView desc = new TextView(this);
+        desc.setText(R.string.debug_disable_safe_mode_desc);
+        desc.setTextColor(COLOR_SUB);
+        desc.setTextSize(11);
+        desc.setPadding(0, dp(4), dp(8), 0);
+        labels.addView(desc);
+        row.addView(labels, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        disableSafeModeSwitch = new Switch(this);
+        disableSafeModeSwitch.setContentDescription(
+                getString(R.string.debug_disable_safe_mode_title));
+        // Avoid overwriting a persisted setting before the background read finishes.
+        disableSafeModeSwitch.setEnabled(false);
+        disableSafeModeSwitch.setOnCheckedChangeListener((btn, checked) -> {
+            if (updatingSafeModeSwitch) {
+                return;
+            }
+            disableSafeModeSwitch.setEnabled(false);
+            new Thread(() -> {
+                boolean ok = ShellUtils.setDisableSafeMode(checked);
+                boolean actual = ok ? checked : ShellUtils.isDisableSafeMode();
+                runOnUiThread(() -> {
+                    setSafeModeDisabledSilently(actual);
+                    disableSafeModeSwitch.setEnabled(true);
+                    if (!ok) {
+                        Toast.makeText(this, R.string.toast_op_failed_root,
+                                Toast.LENGTH_SHORT).show();
+                    }
+                });
+            }).start();
+        });
+        row.addView(disableSafeModeSwitch);
+        card.addView(row);
         return card;
     }
 
@@ -432,6 +493,13 @@ public final class DebugActivity extends Activity
     }
 
     // ---- helpers (suppress listener during programmatic change) -------------
+
+    private void setSafeModeDisabledSilently(boolean checked)
+    {
+        updatingSafeModeSwitch = true;
+        disableSafeModeSwitch.setChecked(checked);
+        updatingSafeModeSwitch = false;
+    }
 
     private void setCheckedSilently(boolean checked)
     {
