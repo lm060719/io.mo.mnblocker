@@ -90,6 +90,13 @@ final class Motion {
         private static final float STEP_S = 0.004f;
         /** A dropped-frame gap larger than this is integrated as if it were this. */
         private static final float MAX_FRAME_S = 0.064f;
+        /**
+         * The display's frame interval, as last measured by any running spring.
+         * A spring's first frame has no previous one to measure from; stepping it
+         * a fixed 1/60 s made every motion open with a double-length jump on a
+         * 120 Hz panel.
+         */
+        private static float sFrameS = 1f / 60f;
 
         private final Listener listener;
         private final float restDelta;
@@ -164,9 +171,15 @@ final class Motion {
             if (!running) {
                 return;
             }
-            float dt = lastFrameNanos == 0
-                    ? 1f / 60f
-                    : Math.min((frameTimeNanos - lastFrameNanos) / 1e9f, MAX_FRAME_S);
+            float dt;
+            if (lastFrameNanos == 0) {
+                dt = sFrameS;
+            } else {
+                dt = Math.min((frameTimeNanos - lastFrameNanos) / 1e9f, MAX_FRAME_S);
+                if (dt > 0f && dt < MAX_FRAME_S) {
+                    sFrameS = dt;
+                }
+            }
             lastFrameNanos = frameTimeNanos;
 
             float omega = (float) Math.sqrt(spec.stiffness);

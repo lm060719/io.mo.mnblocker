@@ -28,7 +28,7 @@ import de.robv.android.xposed.XSharedPreferences;
  *     is shared with the settings UI so both sides agree.
  *
  *  2. Per-channel overrides — an explicit user decision for ONE channel,
- *     keyed by "pkg|id", stored as a JSON object under {@code overrides}:
+ *     keyed by "user:N|pkg|id", stored as a JSON object under {@code overrides}:
  *       value true  -> always block this channel
  *       value false -> always allow this channel (even if a regex matches)
  *     An override ALWAYS wins over the regex rules.
@@ -67,7 +67,7 @@ final class RegexConfig {
      */
     private volatile RuleMatcher contentMatcher = RuleMatcher.compileContent(null, null);
     private long configFileLastModified = -1L;
-    /** key "pkg|id" -> true (force block) / false (force allow). */
+    /** User-scoped key -> true (force block) / false (force allow). Legacy keys are inert. */
     private final Map<String, Boolean> overrides = new HashMap<>();
     private boolean masterEnabled = true;
     private boolean matchDescription = true;
@@ -243,6 +243,10 @@ final class RegexConfig {
         return matchDescription;
     }
 
+    RuleMatcher channelMatcher() {
+        return matcher;
+    }
+
     /** @return true if the whole app is whitelisted (never intercept it). */
     boolean isAppWhitelisted(String pkg) {
         if (pkg == null) {
@@ -268,9 +272,9 @@ final class RegexConfig {
      *         Boolean.FALSE -> user forced "allow"
      *         null          -> no override, fall back to regex
      */
-    Boolean overrideFor(String pkg, String channelId) {
+    Boolean overrideFor(String pkg, int userId, String channelId) {
         synchronized (this) {
-            return overrides.get(pkg + "|" + channelId);
+            return userId < 0 ? null : overrides.get(ChannelIdentity.key(pkg, userId, channelId));
         }
     }
 

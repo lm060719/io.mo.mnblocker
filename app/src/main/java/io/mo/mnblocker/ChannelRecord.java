@@ -13,6 +13,8 @@ final class ChannelRecord {
 
     /** Owning app package, e.g. "com.taobao.taobao". */
     final String pkg;
+    /** -1 means an old record with unknown ownership; never use it for a write. */
+    final int userId;
     /** Channel id as registered by the app. */
     final String id;
     /** Human-readable channel name (may equal id on some apps). */
@@ -28,7 +30,13 @@ final class ChannelRecord {
 
     ChannelRecord(String pkg, String id, String name, String desc,
                   int importance, boolean regexMatched, long lastSeen) {
+        this(pkg, ChannelIdentity.UNKNOWN_USER, id, name, desc, importance, regexMatched, lastSeen);
+    }
+
+    ChannelRecord(String pkg, int userId, String id, String name, String desc,
+                  int importance, boolean regexMatched, long lastSeen) {
         this.pkg = pkg == null ? "<unknown>" : pkg;
+        this.userId = userId;
         this.id = id == null ? "" : id;
         this.name = name == null ? "" : name;
         this.desc = desc == null ? "" : desc;
@@ -37,15 +45,16 @@ final class ChannelRecord {
         this.lastSeen = lastSeen;
     }
 
-    /** Stable identity for a channel: package + id. Used as map key / override key. */
+    /** Package + Android user + channel, including channels containing '|'. */
     String key() {
-        return pkg + "|" + id;
+        return ChannelIdentity.key(pkg, userId, id);
     }
 
     JSONObject toJson() {
         JSONObject o = new JSONObject();
         try {
             o.put("pkg", pkg);
+            o.put("userId", userId);
             o.put("id", id);
             o.put("name", name);
             o.put("desc", desc);
@@ -61,6 +70,7 @@ final class ChannelRecord {
     static ChannelRecord fromJson(JSONObject o) {
         return new ChannelRecord(
                 o.optString("pkg", "<unknown>"),
+                o.optInt("userId", ChannelIdentity.UNKNOWN_USER),
                 o.optString("id", ""),
                 o.optString("name", ""),
                 o.optString("desc", ""),

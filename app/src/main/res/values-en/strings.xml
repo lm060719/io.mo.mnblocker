@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="channel_user_primary">Primary profile</string>
+    <string name="channel_user_clone">Cloned app</string>
+    <string name="channel_user_other_fmt">User %1$d</string>
     <string name="app_name">Marketing Notification Blocker</string>
     <string name="xposed_description">Hooks the system framework to auto-detect and silence notification channels matching keywords like "marketing". Supports regex and batch regex rules, with built-in safe mode and hook logging.</string>
 

@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="channel_user_primary">主应用</string>
+    <string name="channel_user_clone">双开应用</string>
+    <string name="channel_user_other_fmt">用户 %1$d</string>
     <string name="app_name">营销通知拦截器</string>
     <string name="xposed_description">Hook 系统框架，自动识别并关闭包含「营销」等关键字的通知类别。支持正则与批量正则，内置安全模式与 Hook 日志。</string>
 

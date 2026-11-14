@@ -43,13 +43,10 @@ final class DetectedChannelsStore {
      * Synchronised: system_server may invoke channel APIs from several threads.
      */
     synchronized void record(ChannelRecord r) {
-        if (!loadedFromDisk) {
-            // Preserve entries from previous boots so the list is not wiped on reboot.
-            for (ChannelRecord prev : readAllFromDisk()) {
-                live.put(prev.key(), prev);
-            }
-            loadedFromDisk = true;
-        }
+        ensureLoaded();
+        ChannelRecord prev = live.get(r.key());
+        if (prev != null && prev.importance == r.importance && prev.regexMatched == r.regexMatched
+                && prev.name.equals(r.name) && prev.desc.equals(r.desc)) return;
 
         // Re-insert at the end so most-recently-seen sorts last by insertion.
         live.remove(r.key());
@@ -148,7 +145,14 @@ final class DetectedChannelsStore {
 
     /** Hook-side snapshot, for logging/debugging. */
     synchronized Collection<ChannelRecord> snapshot() {
+        ensureLoaded();
         return new ArrayList<>(live.values());
+    }
+
+    private void ensureLoaded() {
+        if (loadedFromDisk) return;
+        for (ChannelRecord prev : readAllFromDisk()) live.put(prev.key(), prev);
+        loadedFromDisk = true;
     }
 
     /** Replace the whole file (used by the UI's "clear list" if ever needed). */

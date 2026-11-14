@@ -2,19 +2,15 @@ package io.mo.mnblocker;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
-import android.app.NotificationChannelGroup;
 import android.app.NotificationManager;
 import android.os.Bundle;
 import android.os.FileObserver;
 import android.service.notification.StatusBarNotification;
 
-import java.lang.reflect.Array;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -24,24 +20,24 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 /**
  * Installs the actual hooks inside the system framework (system_server).
  *
- * Two things are hooked, both living in the "android" package:
+ * Channel and content hooks live in the "android" package:
  *
  *  1. The notification-channel store. Whenever an app creates or updates a
  *     channel, we test its id / name / description against the regex rules and,
  *     on a match, force importance to IMPORTANCE_NONE — i.e. the channel is
  *     silenced ("一键关闭").
  *
- *  2. ActivityManagerService app-death, purely to feed {@link SafetyManager}
- *     so it can detect a SystemUI crash loop. We do NOT hook anything inside
- *     SystemUI itself — only the framework, as required.
+ *  2. Notification enqueue for optional content filtering, and
+ *     ActivityManagerService app-death to feed {@link SafetyManager}.
+ *     The notification menu integration lives separately in {@link SystemUiHook}.
  *
  * Compatibility:
  *  - "api101" / modern Android: channel store is
  *    com.android.server.notification.PreferencesHelper.
  *  - "legacy" (Android 8.0-8.1): it was com.android.server.notification.RankingHelper.
  *  Method overloads differ across releases, so we hook *every* overload by name
- *  (hookAllMethods) and locate the NotificationChannel argument by type instead
- *  of relying on a fixed parameter index.
+ *  (hookAllMethods), but only known owner signatures may modify a channel.
+ *  Queries only observe; configuration changes use explicit NMS writes.
  */
 final class NotificationHook {
 
@@ -53,6 +49,8 @@ final class NotificationHook {
     private volatile RegexConfig config;
     private LoadPackageParam lpparam;
     private volatile boolean hooksInstalled;
+    private ChannelConfigReconciler reconciler;
+    private final ThreadLocal<Boolean> reconciling = new ThreadLocal<>();
     /** Retained as a field so the observer thread keeps it (and us) alive. */
     private FileObserver flagObserver;
     /** Live record of every channel seen, surfaced to the settings UI. */
@@ -104,8 +102,10 @@ final class NotificationHook {
         // The channel store is always hooked: even when the master switch is off
         // we still want to *populate the detected list* for the UI — we just
         // won't modify importance in that case (decided inside the callback).
-        hookChannelStore(lpparam);
-        hookChannelQueries(lpparam);
+        if (android.os.Build.VERSION.SDK_INT >= 26) {
+            hookChannelStore(lpparam);
+            hookChannelQueries(lpparam);
+        }
 
         // Content-level interception on the notification-post path. Always hooked,
         // but the callback self-gates on the master + content-enabled switches, so
@@ -115,6 +115,14 @@ final class NotificationHook {
         // Safety watcher is installed regardless of the master switch.
         hookAmsForSafety(lpparam);
 
+        if (android.os.Build.VERSION.SDK_INT >= 26) {
+            try {
+                reconciler = new ChannelConfigReconciler(detectedStore, this::reconcileChannel);
+                reconciler.start();
+            } catch (Throwable t) {
+                HookLogger.e("Could not start channel configuration sync", t);
+            }
+        }
         hooksInstalled = true;
         // Tell the settings UI, in the only way the two processes can talk, that
         // a hook of this version is actually live. Deliberately placed after the
@@ -213,23 +221,15 @@ final class NotificationHook {
      */
     private void hookChannelQueries(LoadPackageParam lpparam) {
         int hooked = 0;
+        // Observe only the helpers whose first two arguments identify the target owner.
+        // BinderService has callingPkg/targetPkg variants and must not be guessed.
         String[] classes = {
-                "com.android.server.notification.NotificationManagerService",
-                "com.android.server.notification.NotificationManagerService$BinderService",
                 "com.android.server.notification.PreferencesHelper",
                 "com.android.server.notification.RankingHelper"
         };
         String[] methods = {
-                "getNotificationChannel",
-                "getNotificationChannels",
-                "getNotificationChannelsForPackage",
-                "getConversationNotificationChannel",
-                "getConversations",
-                "getConversationsForPackage",
-                "getNotificationChannelGroup",
-                "getNotificationChannelGroups",
-                "getNotificationChannelGroupsForPackage",
-                "getNotificationChannelGroupForPackage"
+                "getNotificationChannel", "getNotificationChannels",
+                "getConversationNotificationChannel"
         };
         for (String className : classes) {
             Class<?> clazz = XposedHelpers.findClassIfExists(className, lpparam.classLoader);
@@ -274,7 +274,10 @@ final class NotificationHook {
                     return;
                 }
 
-                String pkg = describeCaller(param.args);
+                if (Boolean.TRUE.equals(reconciling.get())) return;
+                ChannelIdentity owner = NotificationOwnerResolver.channel((Method) param.method, param.args);
+                if (owner == null) return; // Unknown signature: do not guess or modify it.
+                String pkg = owner.pkg;
                 String id = channel.getId();
                 CharSequence nameCs = channel.getName();
                 String name = nameCs == null ? null : nameCs.toString();
@@ -290,10 +293,10 @@ final class NotificationHook {
                 boolean regexBlocked = allowRule == null && blockRule != null;
 
                 // ---- always record the channel for the settings UI list ----
-                recordObservedChannel(pkg, channel, before, regexBlocked, rawDesc);
+                recordObservedChannel(owner, channel, before, regexBlocked, rawDesc);
 
                 // ---- decide: override > app-whitelist/allow-regex > block-regex ----
-                Boolean override = cfg.overrideFor(pkg, id);
+                Boolean override = cfg.overrideFor(pkg, owner.userId, id);
                 boolean shouldBlock;
                 String decisionReason;
                 if (override != null) {
@@ -314,10 +317,12 @@ final class NotificationHook {
                     // List is populated, but the master switch forbids changes.
                     if (shouldBlock) {
                         HookLogger.i("Master OFF — would block but skipping"
-                                + " | caller=" + pkg + " | id=" + HookLogger.safe(id)
+                                + " | caller=" + pkg + " | user=" + owner.userId + " | id=" + HookLogger.safe(id)
                                 + " | reason=" + decisionReason);
                     }
-                    restoreChannelIfAllowed(pkg, channel, before, override, true, decisionReason);
+                    if (restoreChannelIfAllowed(owner, channel, before, override, true, decisionReason)) {
+                        param.setObjectExtra("mnblocker.restored", owner);
+                    }
                     return;
                 }
 
@@ -325,21 +330,23 @@ final class NotificationHook {
                     // Either no rule matched, or the user explicitly allowed it.
                     if (override != null) {
                         HookLogger.i("ALLOWED by user override"
-                                + " | caller=" + pkg + " | id=" + HookLogger.safe(id));
+                                + " | caller=" + pkg + " | user=" + owner.userId + " | id=" + HookLogger.safe(id));
                     }
-                    restoreChannelIfAllowed(pkg, channel, before, override, false, decisionReason);
+                    if (restoreChannelIfAllowed(owner, channel, before, override, false, decisionReason)) {
+                        param.setObjectExtra("mnblocker.restored", owner);
+                    }
                     return;
                 }
 
                 if (before == NotificationManager.IMPORTANCE_NONE) {
                     HookLogger.i("Channel already silenced, no change"
-                            + " | caller=" + pkg + " | id=" + HookLogger.safe(id)
+                            + " | caller=" + pkg + " | user=" + owner.userId + " | id=" + HookLogger.safe(id)
                             + " | reason=" + decisionReason);
                     return;
                 }
 
                 // ---- the actual "关闭" ----
-                originalStateStore.saveIfAbsent(pkg, channel, before);
+                if (!saveOriginal(owner, channel, before)) return;
                 channel.setImportance(NotificationManager.IMPORTANCE_NONE);
                 try {
                     channel.setShowBadge(false);
@@ -349,7 +356,7 @@ final class NotificationHook {
                 }
 
                 HookLogger.i("BLOCKED notification channel"
-                        + " | caller=" + pkg
+                        + " | caller=" + pkg + " | user=" + owner.userId
                         + " | id=" + HookLogger.safe(id)
                         + " | name=" + HookLogger.safe(name)
                         + " | reason=" + decisionReason
@@ -357,6 +364,16 @@ final class NotificationHook {
             } catch (Throwable t) {
                 // Never let our logic break channel creation for the user.
                 HookLogger.e("channelCallback error — passing through untouched", t);
+            }
+        }
+        @Override
+        protected void afterHookedMethod(MethodHookParam param) {
+            if (param.hasThrowable() || Boolean.FALSE.equals(param.getResult())
+                    || Boolean.TRUE.equals(reconciling.get())) return;
+            ChannelIdentity owner = (ChannelIdentity) param.getObjectExtra("mnblocker.restored");
+            NotificationChannel channel = findChannelArg(param.args);
+            if (owner != null && channel != null && channel.getImportance() > 0) {
+                originalStateStore.remove(owner, channel.getId());
             }
         }
     };
@@ -374,21 +391,12 @@ final class NotificationHook {
 
             try {
                 cfg.reloadIfChanged();
-                String pkg = describeCaller(param.args);
-                if ("<unknown>".equals(pkg)) {
-                    return;
-                }
-                int[] count = new int[]{0};
-                int[] changed = new int[]{0};
-                collectAndApplyChannels(pkg, param.getResult(), cfg, new HashSet<>(), count, changed);
-                if (changed[0] > 0) {
-                    persistNotificationPreferences(param.thisObject);
-                }
-                if (count[0] > 0) {
-                    HookLogger.i("Backfilled " + count[0] + " notification channels"
-                            + " | caller=" + pkg
-                            + " | changed=" + changed[0]);
-                }
+                ChannelIdentity owner = NotificationOwnerResolver.channel((Method) param.method, param.args);
+                if (owner == null || param.hasThrowable()) return;
+                // Read-only: never change importance, restore state, or persist NMS config here.
+                ChannelQueryObserver.collect(owner, param.getResult(), cfg.channelMatcher(),
+                        cfg.isMatchDescription(), detectedStore::record);
+
             } catch (Throwable t) {
                 HookLogger.e("channelQueryCallback error", t);
             }
@@ -408,12 +416,12 @@ final class NotificationHook {
         return null;
     }
 
-    private void recordObservedChannel(String pkg, NotificationChannel channel,
+    private void recordObservedChannel(ChannelIdentity owner, NotificationChannel channel,
                                        int importance, boolean regexMatched, String desc) {
         try {
             CharSequence nameCs = channel.getName();
             detectedStore.record(new ChannelRecord(
-                    pkg,
+                    owner.pkg, owner.userId,
                     channel.getId(),
                     nameCs == null ? null : nameCs.toString(),
                     desc,
@@ -425,121 +433,56 @@ final class NotificationHook {
         }
     }
 
-    private void collectAndApplyChannels(String pkg, Object value, RegexConfig cfg,
-                                         Set<Object> seen, int[] count, int[] applied) {
-        if (value == null || seen.contains(value)) {
-            return;
-        }
-        seen.add(value);
-
-        if (value instanceof NotificationChannel) {
-            NotificationChannel c = (NotificationChannel) value;
-            CharSequence nameCs = c.getName();
-            String name = nameCs == null ? null : nameCs.toString();
-            String rawDesc = c.getDescription();
-            String matchDesc = cfg.isMatchDescription() ? rawDesc : null;
-            String allowRule = cfg.firstAllowMatch(c.getId(), name, matchDesc);
-            String blockRule = allowRule != null ? null : cfg.firstMatch(c.getId(), name, matchDesc);
-            boolean regexBlocked = allowRule == null && blockRule != null;
-            int before = c.getImportance();
-            recordObservedChannel(pkg, c, before, regexBlocked, rawDesc);
-            if (applyExistingChannelDecision(pkg, c, before, allowRule, blockRule, cfg)) {
-                applied[0]++;
-            }
-            count[0]++;
-            return;
-        }
-
-        if (value instanceof NotificationChannelGroup) {
-            collectAndApplyChannels(pkg, ((NotificationChannelGroup) value).getChannels(),
-                    cfg, seen, count, applied);
-            return;
-        }
-
-        if (value instanceof Iterable) {
-            for (Object item : (Iterable<?>) value) {
-                collectAndApplyChannels(pkg, item, cfg, seen, count, applied);
-            }
-            return;
-        }
-
-        Class<?> cls = value.getClass();
-        if (cls.isArray()) {
-            int n = Array.getLength(value);
-            for (int i = 0; i < n; i++) {
-                collectAndApplyChannels(pkg, Array.get(value, i), cfg, seen, count, applied);
-            }
-            return;
-        }
-
-        // android.content.pm.ParceledListSlice and ROM variants commonly expose
-        // getList(). Use reflection so this module does not depend on hidden APIs.
-        Object list = invokeNoArg(value, "getList");
-        if (list != null && list != value) {
-            collectAndApplyChannels(pkg, list, cfg, seen, count, applied);
-        }
+    @android.annotation.TargetApi(26)
+    private boolean saveOriginal(ChannelIdentity owner, NotificationChannel channel, int importance) {
+        return originalStateStore.saveIfAbsent(owner, channel.getId(),
+                new OriginalChannelStateStore.OriginalState(importance,
+                        channel.canShowBadge(), channel.canBypassDnd()));
     }
 
-    private boolean applyExistingChannelDecision(String pkg, NotificationChannel channel,
-                                                 int before, String allowRule,
-                                                 String blockRule, RegexConfig cfg) {
-        if (!cfg.isMasterEnabled() || !cfg.isRootModeActive()) {
-            return restoreChannelIfAllowed(pkg, channel, before, cfg.overrideFor(pkg, channel.getId()),
-                    true, "master-off");
+    @android.annotation.TargetApi(26)
+    private void reconcileChannel(Object notificationService, ChannelIdentity owner, int uid,
+                                  NotificationChannel copy) throws Throwable {
+        if (!safety.hookingAllowed()) return;
+        RegexConfig cfg = config;
+        if (cfg == null) return;
+        cfg.reloadIfChanged();
+        int before = copy.getImportance();
+        String desc = cfg.isMatchDescription() ? copy.getDescription() : null;
+        String name = copy.getName() == null ? null : copy.getName().toString();
+        Boolean override = cfg.overrideFor(owner.pkg, owner.userId, copy.getId());
+        boolean block = cfg.isRootModeActive() && cfg.isMasterEnabled()
+                && (override != null ? override : !cfg.isAppWhitelisted(owner.pkg)
+                && cfg.firstAllowMatch(copy.getId(), name, desc) == null
+                && cfg.firstMatch(copy.getId(), name, desc) != null);
+        if (block) {
+            if (before == NotificationManager.IMPORTANCE_NONE || !saveOriginal(owner, copy, before)) return;
+            copy.setImportance(NotificationManager.IMPORTANCE_NONE);
+            copy.setShowBadge(false);
+            copy.setBypassDnd(false);
+        } else if (!restoreChannelIfAllowed(owner, copy, before, override,
+                !cfg.isMasterEnabled() || !cfg.isRootModeActive(), "config-change")) {
+            return;
         }
-
-        Boolean override = cfg.overrideFor(pkg, channel.getId());
-        boolean shouldBlock;
-        String reason;
-        if (override != null) {
-            shouldBlock = override;
-            reason = "override(" + (override ? "block" : "allow") + ")";
-        } else if (cfg.isAppWhitelisted(pkg)) {
-            shouldBlock = false;
-            reason = "app-whitelist";
-        } else if (allowRule != null) {
-            shouldBlock = false;
-            reason = "allow:" + allowRule;
-        } else {
-            shouldBlock = blockRule != null;
-            reason = blockRule != null ? "regex:" + blockRule : "no-match";
-        }
-
-        if (!shouldBlock) {
-            return restoreChannelIfAllowed(pkg, channel, before, override, false, reason);
-        }
-
-        if (before == NotificationManager.IMPORTANCE_NONE) {
-            return false;
-        }
-
-        originalStateStore.saveIfAbsent(pkg, channel, before);
-        channel.setImportance(NotificationManager.IMPORTANCE_NONE);
+        reconciling.set(true);
         try {
-            channel.setShowBadge(false);
-            channel.setBypassDnd(false);
-        } catch (Throwable ignored) {
+            XposedHelpers.callMethod(notificationService, "updateNotificationChannelForPackage",
+                    owner.pkg, uid, copy);
+            if (!block) originalStateStore.remove(owner, copy.getId());
+            HookLogger.i("Applied explicit channel config | caller=" + owner.pkg
+                    + " | user=" + owner.userId + " | id=" + HookLogger.safe(copy.getId()));
+        } finally {
+            reconciling.remove();
         }
-
-        HookLogger.i("APPLIED existing notification channel decision"
-                + " | caller=" + pkg
-                + " | id=" + HookLogger.safe(channel.getId())
-                + " | name=" + HookLogger.safe(channel.getName() == null
-                ? null : channel.getName().toString())
-                + " | reason=" + reason
-                + " | importance " + before + " -> 0");
-        return true;
     }
 
-    private boolean restoreChannelIfAllowed(String pkg, NotificationChannel channel, int before,
+    private boolean restoreChannelIfAllowed(ChannelIdentity owner, NotificationChannel channel, int before,
                                             Boolean override, boolean masterOff, String reason) {
+        String pkg = owner.pkg;
         OriginalChannelStateStore.OriginalState original =
-                originalStateStore.get(pkg, channel.getId());
+                originalStateStore.get(owner, channel.getId());
 
         if (before != NotificationManager.IMPORTANCE_NONE) {
-            if (original != null && (masterOff || Boolean.FALSE.equals(override))) {
-                originalStateStore.remove(pkg, channel.getId());
-            }
             return false;
         }
 
@@ -561,9 +504,8 @@ final class NotificationHook {
         } catch (Throwable ignored) {
         }
 
-        originalStateStore.remove(pkg, channel.getId());
         HookLogger.i("RESTORED notification channel"
-                + " | caller=" + pkg
+                + " | caller=" + pkg + " | user=" + owner.userId
                 + " | id=" + HookLogger.safe(channel.getId())
                 + " | name=" + HookLogger.safe(channel.getName() == null
                 ? null : channel.getName().toString())
@@ -571,101 +513,6 @@ final class NotificationHook {
                 + " | source=" + (original == null ? "fallback-default" : "saved-original")
                 + " | importance " + before + " -> " + restoredImportance);
         return true;
-    }
-
-    private void persistNotificationPreferences(Object owner) {
-        if (owner == null) {
-            return;
-        }
-        if (invokeNoArgIfExists(owner, "updateConfig")
-                || invokeNoArgIfExists(owner, "updateConfigLocked")) {
-            return;
-        }
-
-        Object helper = readObjectField(owner, "mPreferencesHelper");
-        if (helper == null) {
-            helper = readObjectField(owner, "mRankingHelper");
-        }
-        if (helper != null && helper != owner) {
-            persistNotificationPreferences(helper);
-            return;
-        }
-
-        Object outer = readObjectField(owner, "this$0");
-        if (outer != null && outer != owner) {
-            persistNotificationPreferences(outer);
-        }
-    }
-
-    private static Object invokeNoArg(Object obj, String methodName) {
-        try {
-            Method m = findNoArgMethod(obj.getClass(), methodName);
-            if (m == null) {
-                return null;
-            }
-            m.setAccessible(true);
-            return m.invoke(obj);
-        } catch (Throwable ignored) {
-            return null;
-        }
-    }
-
-    private static boolean invokeNoArgIfExists(Object obj, String methodName) {
-        try {
-            Method m = findNoArgMethod(obj.getClass(), methodName);
-            if (m == null) {
-                return false;
-            }
-            m.setAccessible(true);
-            m.invoke(obj);
-            HookLogger.i("Persisted notification channel config via "
-                    + obj.getClass().getName() + "#" + methodName);
-            return true;
-        } catch (Throwable t) {
-            HookLogger.e("Failed to persist notification channel config via "
-                    + obj.getClass().getName() + "#" + methodName, t);
-            return false;
-        }
-    }
-
-    private static Method findNoArgMethod(Class<?> cls, String name) {
-        while (cls != null) {
-            try {
-                Method m = cls.getDeclaredMethod(name);
-                if (m.getParameterTypes().length == 0) {
-                    return m;
-                }
-            } catch (NoSuchMethodException ignored) {
-            }
-            cls = cls.getSuperclass();
-        }
-        return null;
-    }
-
-    private static Object readObjectField(Object obj, String fieldName) {
-        try {
-            Field f = findField(obj.getClass(), fieldName);
-            if (f == null) {
-                return null;
-            }
-            f.setAccessible(true);
-            return f.get(obj);
-        } catch (Throwable ignored) {
-            return null;
-        }
-    }
-
-    /** Best-effort: the calling package is usually the first String arg. */
-    private static String describeCaller(Object[] args) {
-        if (args == null) {
-            return "<unknown>";
-        }
-        for (Object a : args) {
-            if (a instanceof String) {
-                return (String) a;
-            }
-        }
-        return "<unknown>";
     }
 
     // ------------------------------------------------------------------
@@ -718,6 +565,8 @@ final class NotificationHook {
                     return;
                 }
 
+                ChannelIdentity owner = NotificationOwnerResolver.enqueue((Method) param.method, param.args);
+                if (owner == null) return;
                 Notification n = findNotificationArg(param.args);
                 if (n == null) {
                     return;
@@ -729,7 +578,7 @@ final class NotificationHook {
                 }
 
                 // Whole-app whitelist: exempt this app entirely.
-                if (cfg.isAppWhitelisted(describeCaller(param.args))) {
+                if (cfg.isAppWhitelisted(owner.pkg)) {
                     return;
                 }
 
@@ -752,7 +601,7 @@ final class NotificationHook {
                 param.setResult(((Method) param.method).getReturnType() == boolean.class
                         ? Boolean.FALSE : null);
                 notificationCleanup.onBlocked(param.thisObject, param.args, n);
-                String pkg = describeCaller(param.args);
+                String pkg = owner.pkg;
                 contentStats.recordBlock(pkg);
                 blockLog.record(pkg, extractField(n, Notification.EXTRA_TITLE),
                         firstNonEmpty(new String[]{
@@ -760,7 +609,7 @@ final class NotificationHook {
                                 extractField(n, Notification.EXTRA_BIG_TEXT)}),
                         blockRule);
                 HookLogger.i("BLOCKED notification (content)"
-                        + " | caller=" + pkg
+                        + " | caller=" + pkg + " | user=" + owner.userId
                         + " | title=" + HookLogger.safe(firstNonEmpty(candidates))
                         + " | reason=content:" + blockRule);
             } catch (Throwable t) {

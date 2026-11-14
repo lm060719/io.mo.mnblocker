@@ -121,7 +121,7 @@ public final class RootFreeNotificationListener extends NotificationListenerServ
             // the channel before checking master/whitelist so the list stays
             // complete. (Recording after those gates froze the list while the
             // master switch was off, and hid every channel of a whitelisted app.)
-            recordObserved(cfg, pkg, channel);
+            recordObserved(cfg, pkg, sbn.getUserId(), channel);
 
             if (!cfg.isMasterEnabled()) {
                 return;
@@ -139,7 +139,7 @@ public final class RootFreeNotificationListener extends NotificationListenerServ
             // ---- channel-level judgment ----
             BlockDecision.Result d = BlockDecision.decide(
                     cfg.channelMatcher(),
-                    channel != null ? cfg.overrideFor(pkg, channel.getId()) : null,
+                    channel != null ? cfg.overrideFor(pkg, sbn.getUserId(), channel.getId()) : null,
                     false, // whole-app whitelist already handled by the early return above
                     channelCandidates(channel, cfg.isMatchDescription()));
 
@@ -190,13 +190,13 @@ public final class RootFreeNotificationListener extends NotificationListenerServ
     }
 
     /** Always record the channel for the settings UI list, regardless of verdict. */
-    private void recordObserved(RootFreeConfig cfg, String pkg, NotificationChannel channel) {
+    private void recordObserved(RootFreeConfig cfg, String pkg, int userId, NotificationChannel channel) {
         if (channel == null || channelStore == null) {
             return;
         }
         boolean matched = cfg.channelMatcher().shouldBlock(
                 channelCandidates(channel, cfg.isMatchDescription()));
-        channelStore.record(new ChannelRecord(pkg, channel.getId(),
+        channelStore.record(new ChannelRecord(pkg, userId, channel.getId(),
                 channel.getName() == null ? null : channel.getName().toString(),
                 channel.getDescription(), channel.getImportance(), matched,
                 System.currentTimeMillis()));

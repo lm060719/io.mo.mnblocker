@@ -10,8 +10,8 @@ android {
         applicationId "io.mo.mnblocker"
         minSdk 24            // Android 7.0 — NotificationChannel API starts at 26, lower kept for legacy install
         targetSdk 34
-        versionCode 10
-        versionName "1.2.5"
+        versionCode 11
+        versionName "1.2.5.1"
     }
 
     // CI signing (.github/workflows/build-release.yml). Only active when the
@@ -59,6 +59,7 @@ dependencies {
 
     // Local JVM unit tests for the pure rule engine (RuleMatcher).
     testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.mockito:mockito-core:5.14.2'
     // Android's mockable android.jar stubs org.json (throws on every call) in
     // plain JVM unit tests; the real impl is needed to test the root-free
     // stores' JSON read/write. Test-only — never bundled into the APK.

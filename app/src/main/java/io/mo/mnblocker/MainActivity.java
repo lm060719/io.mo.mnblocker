@@ -113,12 +113,14 @@ public final class MainActivity extends Activity
     private Button multiSelectButton;
     private Button selectAllButton;
 
-    // Bottom-tab pages and controls. Only pageMain is built up front; the other
-    // two are inflated the first time their tab is selected (see pageFor).
+    // Bottom-tab pages and controls. Only pageMain is built in onCreate; the other
+    // two follow right after the first frame (see pageFor).
     private FrameLayout contentFrame;
     private View pageMain;
     private View pageStats;
     private View pageMatched;
+    /** Per tab: whether its page is parked out of sight (see park()). */
+    private final boolean[] pageParked = new boolean[TAB_MATCHED + 1];
     private TextView[] tabViews;
     private ImageView[] tabIcons;
     private View[] tabIndicators;
@@ -171,6 +173,7 @@ public final class MainActivity extends Activity
     private final Map<String, Boolean> regexCache = new HashMap<>();
     private String activeJumpPkg;
     private String activeJumpChannelId;
+    private int activeJumpUserId = ChannelIdentity.UNKNOWN_USER;
     private long activeJumpTime;
 
     @Override
@@ -252,6 +255,9 @@ public final class MainActivity extends Activity
         rootFrame.post(() ->
         {
             pageFor(TAB_STATS);
+            // onResume ran before this page existed. Load the numbers now so the
+            // first visit opens on them, not on skeletons that swap out mid-glance.
+            refreshStats();
             pageFor(TAB_MATCHED);
             handleJumpIntent(getIntent());
         });
@@ -278,6 +284,7 @@ public final class MainActivity extends Activity
             return;
         }
 
+        activeJumpUserId = intent.getIntExtra(SystemUiHook.EXTRA_JUMP_USER, ChannelIdentity.UNKNOWN_USER);
         activeJumpPkg = pkg;
         activeJumpChannelId = channelId;
         activeJumpTime = System.currentTimeMillis();
@@ -289,15 +296,15 @@ public final class MainActivity extends Activity
             boolean found = false;
             for (ChannelRecord r : channels)
             {
-                if (pkg.equals(r.pkg) && channelId.equals(r.id))
+                if (pkg.equals(r.pkg) && channelId.equals(r.id) && r.userId == activeJumpUserId)
                 {
                     found = true;
                     break;
                 }
             }
-            if (!found)
+            if (!found && activeJumpUserId >= 0)
             {
-                channels.add(new ChannelRecord(pkg, channelId, channelId, "", 3, false, System.currentTimeMillis()));
+                channels.add(new ChannelRecord(pkg, activeJumpUserId, channelId, channelId, "", 3, false, System.currentTimeMillis()));
             }
         }
 
@@ -318,15 +325,15 @@ public final class MainActivity extends Activity
 
         View targetView = null;
 
-        // Priority 1: Exact row match for pkg + "|" + channelId
+        // Priority 1: Exact row match for user + package + channel.
         if (!TextUtils.isEmpty(channelId))
         {
-            targetView = rowPool.get(pkg + "|" + channelId);
+            targetView = rowPool.get(ChannelIdentity.key(pkg, activeJumpUserId, channelId));
             if (targetView == null)
             {
                 for (Map.Entry<String, LinearLayout> entry : rowPool.entrySet())
                 {
-                    if (entry.getKey().equalsIgnoreCase(pkg + "|" + channelId))
+                    if (entry.getKey().equals(ChannelIdentity.key(pkg, activeJumpUserId, channelId)))
                     {
                         targetView = entry.getValue();
                         break;
@@ -340,7 +347,7 @@ public final class MainActivity extends Activity
         {
             for (Map.Entry<String, LinearLayout> entry : rowPool.entrySet())
             {
-                if (entry.getKey().toLowerCase(Locale.ROOT).startsWith(pkg.toLowerCase(Locale.ROOT) + "|"))
+                if (entry.getKey().startsWith(ChannelIdentity.key(pkg, activeJumpUserId, "")))
                 {
                     targetView = entry.getValue();
                     break;
@@ -443,7 +450,58 @@ public final class MainActivity extends Activity
 
         listContainer = ui.column();
         root.addView(listContainer, Ui.matchWrap());
+
+        // Keep only the rows near the viewport drawn (see updateListWindow). The
+        // scroll view's own resize (IME, multi-window) does not always re-lay out
+        // the list, hence the listener on both.
+        page.scroll.setOnScrollChangeListener((v, x, y, ox, oy) -> updateListWindow());
+        View.OnLayoutChangeListener relayout =
+                (v, l, t, r, b, ol, ot, or, ob) -> updateListWindow();
+        page.scroll.addOnLayoutChangeListener(relayout);
+        listContainer.addOnLayoutChangeListener(relayout);
         return page.scroll;
+    }
+
+    /**
+     * Draw only the list rows within a screen of the viewport.
+     *
+     * The channel list holds up to {@link DetectedChannelsStore#MAX_ENTRIES} real
+     * row views, and Android records a display list for every VISIBLE child,
+     * on screen or not — so opening the tab, or any renderList(), re-recorded all
+     * of them on the UI thread (~960 rows took 200–500 ms on a real device). Rows
+     * further away are INVISIBLE instead: they keep their size, so the scroll
+     * range and every offset (jumpToChannelRow included) are unchanged, but they
+     * are not drawn. Runs during layout, i.e. before the frame that draws it.
+     */
+    private void updateListWindow()
+    {
+        if (listContainer == null || !(pageMatched instanceof ScrollView))
+        {
+            return;
+        }
+        ScrollView scroll = (ScrollView) pageMatched;
+        int h = scroll.getHeight();
+        if (h == 0)
+        {
+            return;
+        }
+        // The list's top in scroll-content coordinates: it sits in the page column.
+        int origin = listContainer.getTop() + ((View) listContainer.getParent()).getTop();
+        int from = scroll.getScrollY() - origin - h;
+        int to = scroll.getScrollY() - origin + 2 * h;
+        for (int i = 0, n = listContainer.getChildCount(); i < n; i++)
+        {
+            View c = listContainer.getChildAt(i);
+            if (c.getVisibility() == View.GONE)
+            {
+                continue;
+            }
+            int want = c.getBottom() > from && c.getTop() < to ? View.VISIBLE : View.INVISIBLE;
+            if (c.getVisibility() != want)
+            {
+                c.setVisibility(want);
+            }
+        }
     }
 
     private View buildStatsPage()
@@ -586,17 +644,56 @@ public final class MainActivity extends Activity
         if (i == TAB_STATS && pageStats == null)
         {
             pageStats = buildStatsPage();
-            pageStats.setVisibility(View.GONE);
             contentFrame.addView(pageStats, matchFrame());
+            park(TAB_STATS);
         }
         else if (i == TAB_MATCHED && pageMatched == null)
         {
             pageMatched = buildMatchedPage();
-            pageMatched.setVisibility(View.GONE);
             contentFrame.addView(pageMatched, matchFrame());
+            park(TAB_MATCHED);
             renderList();
         }
         return builtPage(i);
+    }
+
+    /**
+     * Take an inactive page out of sight without taking it out of the render tree.
+     *
+     * A GONE (or INVISIBLE) page drops out of its parent's display list, and HWUI
+     * then frees the display lists of its whole subtree — so every return to a
+     * tab re-recorded the entire page on the UI thread, inside the transition's
+     * first frame. A parked page stays VISIBLE and keeps its recordings: it is
+     * drawn at alpha 0, which HWUI skips, and shifted off-screen, so it takes no
+     * touches. Hidden from accessibility and from focus, as GONE was.
+     */
+    private void park(int k)
+    {
+        View p = builtPage(k);
+        pageParked[k] = true;
+        p.setLayerType(View.LAYER_TYPE_NONE, null);
+        // Block first: clearing focus re-focuses the first focusable in the window,
+        // which must not be back inside this page.
+        ((ViewGroup) p).setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
+        if (p.hasFocus())
+        {
+            p.clearFocus();
+        }
+        p.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+        Motion.set(p, View.ALPHA, 0f);
+        // Past the frame in either orientation.
+        Motion.set(p, View.TRANSLATION_X, getResources().getDisplayMetrics().widthPixels
+                + getResources().getDisplayMetrics().heightPixels);
+    }
+
+    /** Undo park()'s focus / accessibility gating; the caller places the page. */
+    private void unpark(int k)
+    {
+        View p = builtPage(k);
+        pageParked[k] = false;
+        // ScrollView's own default — every page is a Ui.page() scroll view.
+        ((ViewGroup) p).setDescendantFocusability(ViewGroup.FOCUS_AFTER_DESCENDANTS);
+        p.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO);
     }
 
     /** Select a tab with no transition — first layout, rotation restore, jumps. */
@@ -611,11 +708,18 @@ public final class MainActivity extends Activity
                 continue;
             }
             // set() also stops any spring mid-flight and drops its end action, so
-            // an interrupted fade-out can no longer hide the page afterwards.
-            Motion.set(p, View.ALPHA, 1f);
-            Motion.set(p, View.TRANSLATION_X, 0f);
-            p.setLayerType(View.LAYER_TYPE_NONE, null);
-            p.setVisibility(k == i ? View.VISIBLE : View.GONE);
+            // an interrupted fade-out can no longer park the page afterwards.
+            if (k == i)
+            {
+                unpark(k);
+                Motion.set(p, View.ALPHA, 1f);
+                Motion.set(p, View.TRANSLATION_X, 0f);
+                p.setLayerType(View.LAYER_TYPE_NONE, null);
+            }
+            else
+            {
+                park(k);
+            }
         }
 
         applyTabColors(i, false);
@@ -657,13 +761,14 @@ public final class MainActivity extends Activity
             {
                 continue;
             }
+            final int page = k;
             if (k == i)
             {
-                if (p.getVisibility() != View.VISIBLE)
+                if (pageParked[k])
                 {
+                    unpark(k);
                     Motion.set(p, View.ALPHA, 0f);
                     Motion.set(p, View.TRANSLATION_X, dx);
-                    p.setVisibility(View.VISIBLE);
                 }
                 // Hardware layer while moving: fading a whole ScrollView subtree
                 // without one re-renders every child each frame (7 ms -> 27 ms p90).
@@ -675,16 +780,11 @@ public final class MainActivity extends Activity
                     onTabSettled(target);
                 });
             }
-            else if (p.getVisibility() == View.VISIBLE)
+            else if (!pageParked[k])
             {
                 p.setLayerType(View.LAYER_TYPE_HARDWARE, null);
                 Motion.animate(p, View.TRANSLATION_X, -dx, Motion.STANDARD);
-                Motion.animate(p, View.ALPHA, 0f, Motion.STANDARD, () ->
-                {
-                    p.setVisibility(View.GONE);
-                    p.setLayerType(View.LAYER_TYPE_NONE, null);
-                    Motion.set(p, View.TRANSLATION_X, 0f);
-                });
+                Motion.animate(p, View.ALPHA, 0f, Motion.STANDARD, () -> park(page));
             }
         }
 
@@ -1230,7 +1330,10 @@ public final class MainActivity extends Activity
         }, s ->
         {
             channels.clear();
-            channels.addAll(s.channels);
+            // Legacy rows have no trustworthy owner; re-observe instead of assigning user 0.
+            for (ChannelRecord record : s.channels) {
+                if (record.userId >= 0) channels.add(record);
+            }
             channelsLoaded = true;
             regexCache.clear(); // the records themselves may have changed
 
@@ -1263,15 +1366,15 @@ public final class MainActivity extends Activity
                     boolean found = false;
                     for (ChannelRecord r : channels)
                     {
-                        if (activeJumpPkg.equals(r.pkg) && activeJumpChannelId.equals(r.id))
+                        if (activeJumpPkg.equals(r.pkg) && activeJumpChannelId.equals(r.id) && r.userId == activeJumpUserId)
                         {
                             found = true;
                             break;
                         }
                     }
-                    if (!found)
+                    if (!found && activeJumpUserId >= 0)
                     {
-                        channels.add(new ChannelRecord(activeJumpPkg, activeJumpChannelId, activeJumpChannelId, "", 3, false, System.currentTimeMillis()));
+                        channels.add(new ChannelRecord(activeJumpPkg, activeJumpUserId, activeJumpChannelId, activeJumpChannelId, "", 3, false, System.currentTimeMillis()));
                     }
                 }
 
@@ -1827,6 +1930,13 @@ public final class MainActivity extends Activity
         return row;
     }
 
+    private String channelUserLabel(int userId)
+    {
+        if (userId == 0) return getString(R.string.channel_user_primary);
+        if (userId == 999) return getString(R.string.channel_user_clone);
+        return getString(R.string.channel_user_other_fmt, userId);
+    }
+
     private void bindChannelRow(LinearLayout row, ChannelRecord r)
     {
         final String key = r.key();
@@ -1861,7 +1971,7 @@ public final class MainActivity extends Activity
         text.setPadding(multiSelectMode ? 0 : ui.dp(Ui.S_HALF), 0, ui.dp(Ui.S2), 0);
         nameView.setText(displayName(r));
         sw.setContentDescription(displayName(r));
-        metaView.setText(r.pkg + "  ·  id=" + (TextUtils.isEmpty(r.id) ? "—" : r.id));
+        metaView.setText(r.pkg + "  ·  " + channelUserLabel(r.userId) + "  ·  id=" + (TextUtils.isEmpty(r.id) ? "—" : r.id));
 
         statusLine.setText(getString(R.string.status_line_fmt, verdictSource(r),
                 getString(blocked ? R.string.status_blocked : R.string.status_allowed)));

@@ -124,9 +124,9 @@ final class RootFreeConfig {
         }
     }
 
-    Boolean overrideFor(String pkg, String channelId) {
+    Boolean overrideFor(String pkg, int userId, String channelId) {
         synchronized (this) {
-            return overrides.get(pkg + "|" + channelId);
+            return userId < 0 ? null : overrides.get(ChannelIdentity.key(pkg, userId, channelId));
         }
     }
 

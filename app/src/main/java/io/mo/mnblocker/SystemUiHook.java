@@ -44,6 +44,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 public final class SystemUiHook {
 
     public static final String EXTRA_JUMP_PKG = "io.mo.mnblocker.extra.JUMP_PKG";
+    public static final String EXTRA_JUMP_USER = "io.mo.mnblocker.extra.JUMP_USER";
     public static final String EXTRA_JUMP_CHANNEL = "io.mo.mnblocker.extra.JUMP_CHANNEL";
 
     private static final String BUTTON_TAG = "mnblocker_manage_btn";
@@ -128,6 +129,9 @@ public final class SystemUiHook {
                     return;
                 }
                 String channelId = extractChannelId(param.thisObject, param.args);
+                StatusBarNotification sbn = extractSbn(param.thisObject, param.args);
+                int userId = sbn == null ? ChannelIdentity.UNKNOWN_USER : sbn.getUserId();
+                if (sbn != null) pkg = sbn.getPackageName();
 
                 ViewGroup root = findContainerViewGroup(param.thisObject, param.args);
                 if (root == null) {
@@ -136,11 +140,11 @@ public final class SystemUiHook {
 
                 View existing = root.findViewWithTag(BUTTON_TAG);
                 if (existing != null) {
-                    setupClickListener(existing, pkg, channelId);
+                    setupClickListener(existing, pkg, channelId, userId);
                     return;
                 }
 
-                View tile = createMiuiMenuItem(root.getContext(), pkg, channelId);
+                View tile = createMiuiMenuItem(root.getContext(), pkg, channelId, userId);
                 tile.setTag(BUTTON_TAG);
 
                 // Determine target margin from existing native children or system dimen resource
@@ -201,7 +205,7 @@ public final class SystemUiHook {
         }
     };
 
-    private View createMiuiMenuItem(Context context, String pkg, String channelId) {
+    private View createMiuiMenuItem(Context context, String pkg, String channelId, int userId) {
         // Strategy A: Try inflating native SystemUI layout 'miui_notification_modal_menu'
         try {
             int layoutRes = context.getResources().getIdentifier("miui_notification_modal_menu", "layout", "com.android.systemui");
@@ -231,7 +235,7 @@ public final class SystemUiHook {
                         iv.setImageDrawable(createShieldIconDrawable(context));
                     }
                 }
-                setupClickListener(menuItem, pkg, channelId);
+                setupClickListener(menuItem, pkg, channelId, userId);
                 return menuItem;
             }
         } catch (Throwable ignored) {
@@ -280,7 +284,7 @@ public final class SystemUiHook {
         itemLayout.addView(iconView);
         itemLayout.addView(titleView);
 
-        setupClickListener(itemLayout, pkg, channelId);
+        setupClickListener(itemLayout, pkg, channelId, userId);
         return itemLayout;
     }
 
@@ -330,7 +334,7 @@ public final class SystemUiHook {
         };
     }
 
-    private void setupClickListener(View tile, final String pkg, final String channelId) {
+    private void setupClickListener(View tile, final String pkg, final String channelId, final int userId) {
         tile.setOnClickListener(v -> {
             try {
                 Context context = v.getContext();
@@ -339,6 +343,7 @@ public final class SystemUiHook {
                 Intent intent = new Intent();
                 intent.setComponent(new ComponentName("io.mo.mnblocker", "io.mo.mnblocker.MainActivity"));
                 intent.putExtra(EXTRA_JUMP_PKG, pkg);
+                intent.putExtra(EXTRA_JUMP_USER, userId);
                 if (channelId != null) {
                     intent.putExtra(EXTRA_JUMP_CHANNEL, channelId);
                 }
@@ -370,6 +375,18 @@ public final class SystemUiHook {
             }
         } catch (Throwable ignored) {
         }
+    }
+
+    private StatusBarNotification extractSbn(Object target, Object[] args) {
+        StatusBarNotification direct = findArg(args, StatusBarNotification.class);
+        if (direct != null) return direct;
+        Object entry = findArgByClassName(args, "NotificationEntry");
+        if (entry == null && target != null) entry = readField(target, "mEntry");
+        if (entry == null && target != null) entry = readField(target, "entry");
+        Object sbn = entry == null ? null : invokeMethod(entry, "getSbn");
+        if (sbn == null && entry != null) sbn = readField(entry, "mSbn");
+        if (sbn == null && target != null) sbn = readField(target, "mSbn");
+        return sbn instanceof StatusBarNotification ? (StatusBarNotification) sbn : null;
     }
 
     private String extractPkg(Object target, Object[] args) {
